@@ -107,6 +107,7 @@ namespace VRCFTBrokenEyeModule
         public override void Teardown()
         {
             beTcpClient.Dispose();
+            SmoothFloatWorkers.Destroy();
         }
     }
 
