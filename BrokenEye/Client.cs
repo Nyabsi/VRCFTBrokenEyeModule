@@ -3,176 +3,60 @@ using System.Net.Sockets;
 using System.Text;
 using Microsoft.Extensions.Logging;
 using System.Text.Json;
+using System.IO;
 
-namespace PimaxCrystalAdvanced.BrokenEye;
-
-public class Client : IDisposable
+namespace VRCFTBrokenEyeModule
 {
-    private readonly ILogger _logger;
-    private TcpClient? _client;
-    private IPAddress? _ipAddress;
-    private short _port;
-    private readonly CancellationTokenSource _cancellationTokenSource = new();
-
-    public event Action<EyeData>? OnData;
-
-    public Client(ILogger logger)
+    public class Client : IDisposable
     {
-        _logger = logger;
-    }
+        private TcpClient client = new();
 
-    public bool Connect(string ip, int port)
-    {
-        _client = new TcpClient();
-        _ipAddress = IPAddress.Parse(ip);
-        _port = Convert.ToInt16(port);
-
-        _logger.LogInformation($"Connecting to {ip}:{port}...");
-
-        try
+        public bool Connect()
         {
-            var result = _client.ConnectAsync(_ipAddress, _port).Wait(TimeSpan.FromSeconds(3));
-            if (!result)
+            try
             {
-                _logger.LogError("Failed to connect to server");
+                client.Connect("127.0.0.1", 5555);
+
+                var stream = client.GetStream();
+                var request = new byte[] { 0x00 };
+                stream.Write(request);
+            }
+            catch (Exception)
+            {
                 return false;
             }
-        }
-        catch (Exception e)
-        {
-            _logger.LogError($"Failed to connect to server ({e.Message})");
-            return false;
+
+            return true;
         }
 
-        _logger.LogInformation("Connected to server");
-
-        Task.Run(HandleAsyncData, _cancellationTokenSource.Token);
-
-        return true;
-    }
-
-    private async void HandleAsyncData()
-    {
-        var reconnectAttempts = 0;
-        const int maxReconnectAttempts = 5;
-
-        while (true)
+        public (bool, EyeData) FetchData()
         {
-            // Try to reconnect every 5 seconds
-            try
+            if (client.Connected)
             {
-                if (reconnectAttempts > maxReconnectAttempts)
-                {
-                    _logger.LogError(
-                        $"Failed to reconnect to server after {maxReconnectAttempts} attempts, giving up :(");
-                    return;
-                }
+                var stream = client.GetStream();
 
-                if (_client is not { Connected: true })
-                {
-                    _logger.LogInformation("Reconnecting to server...");
+                var buffer = new byte[5];
+                var read = stream.Read(buffer);
 
-                    _client?.Close();
-                    _client = new TcpClient();
+                var lengthBytes = buffer[1..];
+                var length = BitConverter.ToUInt32(lengthBytes);
 
-                    reconnectAttempts++;
+                var data = new byte[length];
+                read = stream.Read(data);
 
-                    _client.ConnectAsync(_ipAddress!, _port).Wait(TimeSpan.FromSeconds(3));
+                var jsonString = Encoding.UTF8.GetString(data);
 
-                    _logger.LogInformation("Reconnected to server");
-
-                    reconnectAttempts = 0;
-                }
-            }
-            catch (Exception e)
-            {
-                _logger.LogError($"Failed to reconnect to server, retrying in 5 seconds... ({e.Message})");
-                await Task.Delay(TimeSpan.FromSeconds(5));
+                EyeData eyeDataValue = JsonSerializer.Deserialize<EyeData>(jsonString);
+                return (true, eyeDataValue);
             }
 
-            if (_client == null)
-            {
-                continue;
-            }
-
-            // Process stream
-            try
-            {
-                var stream = _client.GetStream();
-                stream.ReadTimeout = 10000;
-                stream.WriteTimeout = 10000;
-
-                // Request advanced data stream
-                const byte requestId = 0x00;
-                var request = new Memory<byte>(new[] { requestId });
-                await stream.WriteAsync(request);
-
-                while (true)
-                {
-                    await ReadData(stream, requestId);
-                }
-            }
-            catch (Exception e)
-            {
-                _logger.LogError($"Failed to read data from server ({e.Message})");
-            }
+            Connect(); // attempt to silently reconnect
+            return (false, new EyeData());
         }
-    }
 
-    private async Task ReadData(Stream stream, byte requestId)
-    {
-        // Read id(1 byte) and length (4 bytes big endian)
-        var buffer = new byte[5];
-        var read = await stream.ReadAsync(buffer);
-        if (read != buffer.Length)
+        public void Dispose()
         {
-            throw new Exception("Failed to read data");
+            client?.Close();
         }
-
-        var id = buffer[0];
-        if (id != requestId)
-        {
-            throw new Exception("Invalid response id");
-        }
-
-        var lengthBytes = buffer[1..];
-        var length = BitConverter.ToUInt32(lengthBytes);
-
-        var data = new byte[length];
-        read = await stream.ReadAsync(data);
-        if (read != length)
-        {
-            throw new Exception("Failed to read data");
-        }
-
-        var jsonString = Encoding.UTF8.GetString(data);
-
-        try
-        {
-            EyeData? eyeDataValue = JsonSerializer.Deserialize<EyeData>(jsonString);
-            if (!eyeDataValue.HasValue)
-            {
-                throw new Exception("Failed to deserialize data");
-            }
-
-            var eyeData = eyeDataValue.Value;
-
-            // Flip X axis
-            eyeData.Left.GazeDirection.X = -eyeData.Left.GazeDirection.X;
-            eyeData.Right.GazeDirection.X = -eyeData.Right.GazeDirection.X;
-
-            OnData?.Invoke(eyeData);
-        }
-        catch (Exception e)
-        {
-            _logger.LogError($"Failed to deserialize data ({e.Message}): {jsonString}");
-            throw;
-        }
-    }
-
-    public void Dispose()
-    {
-        _cancellationTokenSource.Cancel();
-        _client?.Close();
     }
 }
